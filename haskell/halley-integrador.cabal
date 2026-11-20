@@ -1,0 +1,29 @@
+cabal-version:      3.0
+name:               halley-integrador
+version:            0.1.0.0
+synopsis:           Integrador de evidencia forense de Halley-7 (C1)
+build-type:         Simple
+
+common comun
+    default-language: Haskell2010
+    ghc-options:      -Wall
+    build-depends:    base >=4.17 && <5, text, time, containers
+
+library
+    import:           comun
+    hs-source-dirs:   src
+    exposed-modules:  Tipos
+                      Hora
+
+executable halley-integrador
+    import:           comun
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    halley-integrador, http-client, bytestring
+
+test-suite halley-test
+    import:           comun
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    build-depends:    halley-integrador, hspec
