@@ -98,3 +98,178 @@ SELECT texto,
        count(*) > 1                              AS ambiguo
 FROM alias
 GROUP BY texto;
+
+
+
+-- ---------------------------------------------------------------------
+-- 2. TABLAS DE EVIDENCIA (SOLO-ANEXO)
+--
+-- Regla del proyecto: estas tablas solo reciben INSERT. Nunca UPDATE ni
+-- DELETE. Eso lo garantizan los triggers de db/triggers.sql y los
+-- permisos del rol de la aplicación.
+--
+-- Todas tienen dos identificadores:
+--   seq : número automático y creciente que da el orden de llegada.
+--   id  : identificador legible que viaja en los JSON ('tarj-000123',
+--         'prob-0007'...). Es TEXTO porque así lo genera Haskell.
+-- ---------------------------------------------------------------------
+
+-- Cada registro de evidencia: una línea de un archivo, una lectura en
+-- vivo o una evidencia derivada (por ejemplo, una anomalía que detecta Julia).
+CREATE TABLE IF NOT EXISTS evidencia (
+    seq             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id              TEXT NOT NULL UNIQUE,
+    fuente_id       TEXT NOT NULL REFERENCES fuentes(id),
+
+    -- De dónde salió el registro:
+    --   archivo  = una de las 6 fuentes recuperadas (vía Haskell)
+    --   vivo     = lectura que llegó del simulador (vía Julia)
+    --   derivada = la calculó el sistema (anomalía). Se marca para no
+    --              mezclarla nunca con el dato crudo.
+    origen          TEXT NOT NULL CHECK (origen IN ('archivo', 'vivo', 'derivada')),
+    linea           INT,                    -- línea del archivo original (NULL si es en vivo)
+
+    -- Qué pasó. Coincide con los constructores de TipoEvento en Haskell.
+    tipo            TEXT NOT NULL CHECK (tipo IN (
+                        'acceso_tarjeta', 'conteo_personas', 'presencia_sin_energia',
+                        'lectura_temperatura', 'corte_energia', 'energia_restablecida',
+                        'consumo_electrico', 'mensaje_radio', 'nota_bitacora',
+                        'anomalia_temperatura')),
+
+    -- Quién. persona_texto guarda el nombre TAL COMO apareció ("doc",
+    -- "Luka"); persona_id es la identidad canónica si se pudo resolver.
+    -- Si el alias es ambiguo, persona_id queda NULL y los candidatos se
+    -- obtienen uniendo persona_texto con la tabla alias.
+    persona_texto   TEXT,
+    persona_id      TEXT REFERENCES personas(id),
+    tarjeta_codigo  TEXT REFERENCES tarjetas(codigo),   -- NULL si la tarjeta es ilegible ('AK-0?')
+    modulo_id       TEXT REFERENCES modulos(id),
+    puerta_id       TEXT REFERENCES puertas(id),
+
+    -- Cuándo. Siempre en UTC. Se conserva además la hora original tal
+    -- como venía ('01.30', '2254786200', '01:50 aprox.').
+    ts_utc          TIMESTAMPTZ,
+    ts_precision    TEXT NOT NULL CHECK (ts_precision IN ('exacta', 'aproximada', 'desconocida')),
+    ts_margen_min   INT  NOT NULL DEFAULT 0 CHECK (ts_margen_min >= 0),
+    ts_original     TEXT,
+
+    -- Estado del registro. Los corruptos y duplicados SE GUARDAN (no se
+    -- descartan), pero Prolog no los usa como prueba.
+    estado          TEXT NOT NULL CHECK (estado IN (
+                        'valido', 'sospechoso', 'ambiguo', 'duplicado', 'corrupto')),
+
+    -- Datos propios de cada tipo (valor de temperatura, módulos afectados
+    -- por un corte, texto del mensaje de radio...). Se usa JSONB porque
+    -- cada tipo de evento trae campos distintos.
+    datos           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    crudo           TEXT  NOT NULL,          -- la línea original, intacta
+    recibido_en     TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Coherencia de la hora: si es exacta o aproximada debe existir;
+    -- si es desconocida no puede tener valor.
+    CHECK ((ts_precision = 'desconocida') = (ts_utc IS NULL)),
+    -- Solo una hora aproximada puede tener margen.
+    CHECK (ts_precision = 'aproximada' OR ts_margen_min = 0)
+);
+
+-- Índices para las búsquedas más comunes (por hora, persona y módulo).
+CREATE INDEX IF NOT EXISTS evidencia_ts_idx      ON evidencia (ts_utc);
+CREATE INDEX IF NOT EXISTS evidencia_persona_idx ON evidencia (persona_id);
+CREATE INDEX IF NOT EXISTS evidencia_modulo_idx  ON evidencia (modulo_id);
+
+-- Problemas encontrados en las fuentes. Coincide con TipoProblema en Haskell.
+CREATE TABLE IF NOT EXISTS problemas (
+    seq             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id              TEXT NOT NULL UNIQUE,
+    fuente_id       TEXT NOT NULL REFERENCES fuentes(id),
+    linea           INT,
+    tipo            TEXT NOT NULL CHECK (tipo IN (
+                        'duplicado', 'corrupto', 'separador_distinto', 'hora_formato_raro',
+                        'fecha_ausente', 'linea_fusionada', 'modulo_nombre_alterno',
+                        'alias_usado', 'alias_ambiguo', 'contradiccion',
+                        'tarjeta_sospechosa')),
+    descripcion     TEXT NOT NULL,
+    crudo           TEXT,
+    severidad       TEXT NOT NULL CHECK (severidad IN ('baja', 'media', 'alta')),
+    registrado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Qué evidencia sustenta cada problema. Una contradicción, por ejemplo,
+-- apunta a tres registros: energía 01:40, radio 01:47 y bitácora 01:50.
+-- Es una tabla aparte (y no un arreglo) para poder poner llaves foráneas.
+CREATE TABLE IF NOT EXISTS problema_evidencia (
+    problema_id     TEXT NOT NULL REFERENCES problemas(id),
+    evidencia_id    TEXT NOT NULL REFERENCES evidencia(id),
+    PRIMARY KEY (problema_id, evidencia_id)
+);
+
+-- Correcciones enviadas por las agencias. NUNCA tocan la fila original:
+-- se guardan como una nueva versión de un campo. La vista
+-- evidencia_corregida (se agrega en un commit posterior) aplica la última
+-- versión de cada campo sobre la evidencia original.
+CREATE TABLE IF NOT EXISTS correcciones (
+    seq             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id              TEXT NOT NULL UNIQUE,
+    evidencia_id    TEXT NOT NULL REFERENCES evidencia(id),
+    version         INT  NOT NULL CHECK (version >= 1),   -- 1, 2, 3... por registro de evidencia
+    campo           TEXT NOT NULL CHECK (campo IN (
+                        'ts_utc', 'persona_id', 'tarjeta_codigo', 'modulo_id', 'estado')),
+    valor_nuevo     TEXT,                    -- como texto; Java lo valida según el campo
+    motivo          TEXT NOT NULL,           -- p. ej. 'reloj del lector P4 adelantado 3 min'
+    autor           TEXT NOT NULL,           -- agencia o investigador que la envía
+    creado_en       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (evidencia_id, version)
+);
+
+-- Preguntas que hacen los investigadores.
+-- snapshot_version es el número de la última entrada de la cadena de
+-- hashes que se tuvo en cuenta (ver tabla cadena). Con ese número se
+-- puede reconstruir exactamente qué evidencia y qué correcciones existían
+-- cuando se hizo la pregunta.
+CREATE TABLE IF NOT EXISTS consultas (
+    seq               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id                TEXT NOT NULL UNIQUE,
+    investigador_id   TEXT NOT NULL,
+    pregunta          JSONB NOT NULL,        -- el JSON de consulta del contrato
+    snapshot_version  BIGINT NOT NULL CHECK (snapshot_version >= 0),
+    vista             TEXT NOT NULL CHECK (vista IN ('original', 'corregida')),
+    creado_en         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Respuestas. Una por consulta. Se guarda el JSON completo para poder
+-- compararlo después con una reconstrucción.
+CREATE TABLE IF NOT EXISTS respuestas (
+    seq             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id              TEXT NOT NULL UNIQUE,
+    consulta_id     TEXT NOT NULL UNIQUE REFERENCES consultas(id),
+    resultado       TEXT NOT NULL CHECK (resultado IN ('posible', 'imposible', 'no_se_puede_saber')),
+    razon           TEXT NOT NULL,
+    contenido       JSONB NOT NULL,          -- respuesta completa tal como la devolvió Prolog
+    creado_en       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Evidencia citada por cada respuesta.
+CREATE TABLE IF NOT EXISTS respuesta_evidencia (
+    respuesta_id    TEXT NOT NULL REFERENCES respuestas(id),
+    evidencia_id    TEXT NOT NULL REFERENCES evidencia(id),
+    PRIMARY KEY (respuesta_id, evidencia_id)
+);
+
+-- Cadena de hashes GLOBAL. Cada registro que entra a una tabla
+-- solo-anexo agrega aquí un eslabón:
+--     hash = SHA-256( hash_anterior || contenido_canonico_del_registro )
+-- El primer eslabón usa como hash_anterior 64 ceros (el "génesis").
+-- Si alguien altera una fila, al recalcular su hash ya no coincide y el
+-- verificador señala el eslabón exacto. Como hay una sola cadena para
+-- todas las tablas, seq da además un orden total de todo lo que entró.
+-- El contenido canónico lo calcula Java (se documenta en ese commit).
+CREATE TABLE IF NOT EXISTS cadena (
+    seq             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tabla           TEXT NOT NULL CHECK (tabla IN (
+                        'evidencia', 'problemas', 'correcciones', 'consultas', 'respuestas')),
+    registro_id     TEXT NOT NULL,           -- el id del registro en esa tabla
+    hash_anterior   CHAR(64) NOT NULL CHECK (hash_anterior ~ '^[0-9a-f]{64}$'),
+    hash            CHAR(64) NOT NULL UNIQUE CHECK (hash ~ '^[0-9a-f]{64}$'),
+    creado_en       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tabla, registro_id)              -- cada registro entra a la cadena una sola vez
+);
