@@ -22,6 +22,9 @@
 # definir; -o pipefail: un fallo dentro de una tubería (|) también cuenta.
 set -euo pipefail
 
+# psql debe leer los .sql y los CSV como UTF-8. En Windows usa WIN1252 por
+# defecto y rompe las tildes (Valcarcel, Almacen, estacion).
+export PGCLIENTENCODING=UTF8
 # Ir a la raíz del repositorio (la carpeta padre de scripts/), para que
 # las rutas relativas (db/..., data/entrada/...) funcionen siempre.
 RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

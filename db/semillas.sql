@@ -64,8 +64,10 @@ CREATE TEMP TABLE tmp_personal (
 
 -- Identificador canónico = apellido (última palabra del nombre), en
 -- minúsculas y sin tildes. 'Irene Valcárcel' -> 'valcarcel'.
+-- Las vocales con tilde van como codigos Unicode (U&'\00E1' es a con tilde):
+-- asi esta linea es solo ASCII y no depende de la codificacion del archivo.
 INSERT INTO personas (id, nombre, cargo)
-SELECT translate(lower(regexp_replace(trim(nombre), '^.*\s', '')), 'áéíóúüñ', 'aeiouun'),
+SELECT translate(lower(regexp_replace(trim(nombre), '^.*\s', '')), U&'\00E1\00E9\00ED\00F3\00FA\00FC\00F1', 'aeiouun'),
        trim(nombre),
        trim(cargo)
 FROM tmp_personal
