@@ -1,3 +1,4 @@
 * text=auto
 *.sh text eol=lf
 data/entrada/* -text
+data/entrada.sha256 text eol=lf
